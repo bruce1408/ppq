@@ -19,15 +19,6 @@ class BaseQuantizer(metaclass = ABCMeta):
         graph: BaseGraph,
         verbose: bool = True
     ) -> None:
-        """
-
-        Args:
-            graph (BaseGraph): _description_
-            verbose (bool, optional): _description_. Defaults to True.
-
-        Raises:
-            TypeError: _description_
-        """
         if not isinstance(graph, BaseGraph):
             raise TypeError(f'To initialize a Quantizer, a BaseGraph instance is needed.'\
                 f' While {type(graph)} was givne, if your graph is maintained by GraphCommandProcessor, '\
@@ -98,6 +89,9 @@ class BaseQuantizer(metaclass = ABCMeta):
         if platform is not None: converting_operation.platform = platform
         else: platform = converting_operation.platform
 
+        if platform in {TargetPlatform.FP32, TargetPlatform.SOI}: 
+            return self._graph.operations[op_name]
+
         # if platform == TargetPlatform.UNSPECIFIED we can skip its quantization when type is not supported.
         if platform == TargetPlatform.UNSPECIFIED and converting_operation.type not in self.quant_operation_types:
             return self._graph.operations[op_name]
@@ -111,10 +105,18 @@ class BaseQuantizer(metaclass = ABCMeta):
 
     @ staticmethod
     def create_default_quant_config(
-        op: Operation, num_of_bits: int,
-        quant_min: Union[int, float], quant_max: Union[int, float], 
-        observer_algorithm: str, policy: QuantizationPolicy, 
-        rounding: RoundingPolicy, exponent_bits: int = 0,
+        op: Operation, 
+        num_of_bits: int = 8,
+        quant_min: Union[int, float] = -127, 
+        quant_max: Union[int, float] = 128, 
+        observer_algorithm: str = 'percentile', 
+        policy: QuantizationPolicy = 
+            QuantizationPolicy(
+                QuantizationProperty.PER_TENSOR + 
+                QuantizationProperty.LINEAR + 
+                QuantizationProperty.SYMMETRICAL), 
+        rounding: RoundingPolicy = RoundingPolicy.ROUND_HALF_EVEN, 
+        exponent_bits: int = 0,
     ) -> OperationQuantizationConfig:
         """
         为你的算子创建一个默认量化信息
@@ -289,8 +291,9 @@ class BaseQuantizer(metaclass = ABCMeta):
             if fusion_setting.align_quantization:
                 list_of_passes.append(QuantAlignmentPass(
                     elementwise_alignment = fusion_setting.align_elementwise_to,
-                    concat_alignment = fusion_setting.align_concat_to,
-                    pooling_alignment  = fusion_setting.align_avgpooling_to,
+                    concat_alignment      = fusion_setting.align_concat_to,
+                    pooling_alignment     = fusion_setting.align_avgpooling_to,
+                    resize_alignment      = fusion_setting.align_resize_to,
                     force_overlap = fusion_setting.force_alignment_overlap
                 ))
 
@@ -379,7 +382,7 @@ class BaseQuantizer(metaclass = ABCMeta):
             list_of_passes.append(LayerwiseEqualizationPass(
                 optimize_level       = equalization_setting.opt_level,
                 iterations           = equalization_setting.iterations,
-                weight_threshold     = equalization_setting.value_threshold,
+                value_threshold     = equalization_setting.value_threshold,
                 including_bias       = equalization_setting.including_bias,
                 including_act        = equalization_setting.including_act,
                 bias_multiplier      = equalization_setting.bias_multiplier,

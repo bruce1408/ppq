@@ -223,8 +223,8 @@ class TrainingBasedPass(QuantizationOptimizationPass):
 
     def collect(
         self, graph: BaseGraph, block: TrainableBlock, executor: TorchExecutor, 
-        dataloader: Iterable, collate_fn: Callable, collecting_device: str, steps: int = None
-        ) -> Tuple[List[Dict[str, torch.Tensor]], List[Dict[str, torch.Tensor]]]:
+        dataloader: Iterable, collate_fn: Callable, collecting_device: str, steps: int = None,
+        expire_device: str = 'cpu') -> Tuple[List[Dict[str, torch.Tensor]], List[Dict[str, torch.Tensor]]]:
         """
         Collect training data for given block.
         This function will collect fp32 output and quantized input data by
@@ -273,7 +273,7 @@ class TrainingBasedPass(QuantizationOptimizationPass):
             
             cur_iter = 0
             # dequantize graph, collect fp32 outputs
-            quant_graph.dequantize_graph()
+            quant_graph.dequantize_graph(expire_device=expire_device)
             for data in dataloader:
                 if collate_fn is not None: data = collate_fn(data)
                 fp_output = executor.forward(data, [var.name for var in block.ep.outputs])
@@ -284,7 +284,7 @@ class TrainingBasedPass(QuantizationOptimizationPass):
 
             cur_iter = 0
             # restore quantization state, collect quant inputs
-            quant_graph.restore_quantize_state()
+            quant_graph.restore_quantize_state(expire_device=expire_device)
             for data in dataloader:
                 if collate_fn is not None: data = collate_fn(data)
                 # PATCH 20220829, 有些 computing op 权重并非定值
@@ -590,15 +590,21 @@ class LearnedStepSizePass(TrainingBasedPass):
     The formula of calculating the derivatives of y and scale_Y:
 
         if y > scale_Y * -128 and y < scale_Y * 127:
+        
         dQuant(y, scale_Y)/dy       = dQuant(y, scale_Y)
+        
         dQuant(y, scale_Y)/dscale_Y = Quant(y, scale_Y) - y
 
         if y < scale_Y * -128:
+        
         dQuant(y, scale_Y)/dy       = 0
+        
         dQuant(y, scale_Y)/dscale_Y = -128
 
         if y > scale_Y * 127:
+        
         dQuant(y, scale_Y)/dy       = 0
+        
         dQuant(y, scale_Y)/dscale_Y = 127
 
     ### Parameters:
@@ -690,7 +696,7 @@ class LearnedStepSizePass(TrainingBasedPass):
 
     Parameter block_size will controls the maximum size of created blocks.
 
-    If block_size = 1, then each block will contains exactly 1 layer within it, blockwise optimization will degenerate to layerwise optimization then.
+    If block_size = 1, then each block will contains exactly 1 layer within it, blockwise optimization will degenerate to layerwise optimization.
 
     If block_size is set to a large value, training progress will be unstable since batchnorm layers have been merged at first.
 
@@ -703,18 +709,21 @@ class LearnedStepSizePass(TrainingBasedPass):
     def __init__(
         self, name: str = 'PPQ LSQ Optimization', interested_layers: List[str] = [],
         steps: int = 500, gamma: float = 0.0, is_scale_trainable: bool = True,
-        lr: float = 5e-5, block_size: int = None,
+        lr: float = 5e-5, block_size: int = 5, expire_device: str = 'cpu',
         collecting_device: str = 'cuda', loss_fn: Callable = torch_mean_square_error,
+        optimizer: Any = None
     ) -> None:
         super().__init__(name=name)
         self.interested_layers  = interested_layers
         self.collecting_device  = collecting_device
+        self.expire_device      = expire_device
         self.is_scale_trainable = is_scale_trainable
         self.block_size         = block_size
         self.loss_fn            = loss_fn
         self.gamma              = gamma
         self.steps              = steps
         self.lr                 = lr
+        self.optimizer          = optimizer
 
     def finetune(
         self, steps: int, learning_rate: float, block: TrainableBlock, executor: TorchExecutor,
@@ -757,8 +766,9 @@ class LearnedStepSizePass(TrainingBasedPass):
             return 0, 0
 
         # initilize optimizer.
-        if optimizer is None:
+        if self.optimizer is None:
             optimizer = torch.optim.Adam(tensors, lr=learning_rate)
+        else: optimizer = self.optimizer(tensors, lr=learning_rate)
 
         dataset_length = len(qt_inputs)
         if dataset_length == 0: raise ValueError('Dataset is empty.')
@@ -834,6 +844,177 @@ class LearnedStepSizePass(TrainingBasedPass):
         print(f'Learning Rate:             {self.lr}')
         print(f'Steps:                     {self.steps}')
         print(f'Gamma:                     {self.gamma}')
+        print('') # blank line
+
+        # do per-block finetune
+        for block_idx, block in enumerate(blocks):
+            # collect data for training
+            qt_inputs, fp_outputs = self.collect(
+                graph=graph, block=block, executor=executor, 
+                dataloader=dataloader, collate_fn=collate_fn, 
+                collecting_device=self.collecting_device)
+
+            print(f'# Block [{block_idx + 1} / {len(blocks)}]: '
+                  f'[{block.sp.name} -> {block.ep.name}]')
+            pre_loss, post_loss = self.finetune(
+                steps=self.steps, learning_rate=self.lr, block=block, 
+                qt_inputs=qt_inputs, fp_outputs=fp_outputs, executor=executor)
+            print(f'# Tuning Finished  : ({pre_loss:.4f} -> {min(pre_loss, post_loss):.4f}) [Block Loss]')
+            print('') # blank line
+
+
+class RoundTuningPass(TrainingBasedPass):
+
+    def __init__(
+        self, interested_layers: List[str] = [],
+        steps: int = 500, lr: float = 1e-4, block_size: int = 5,
+        expire_device: str = 'cpu', collecting_device: str = 'cuda', 
+        optimizer: Any = None
+    ) -> None:
+        """ This method trains the weights of neural networks to make them more suitable for quantization compression. 
+        Similar to Adaround, this method restricts the range of weight training within one scale [-scale, +scale], 
+        so this method can also be called round mode adjustment. 
+        
+        Compared to Adaround, this method uses a more direct and simple way to train weights, 
+        and its training effect is similar to Adaround. 
+        
+        Reference: Up or Down? Adaptive Rounding for Post-Training Quantization
+        
+        Parameter:
+            interested_layers: specifies which layers of the neural network need to be trained. 
+                It is a list containing the names of all the layers that need to be trained.
+
+            collecting_device: specifies where the data cache is stored during training, 
+                supporting caching to main memory (CPU) or caching to graphics memory (CUDA).
+                Note that the dataset used for training will be fully cached.
+
+            block_size: used to determine the maximum depth of the subgraph 
+                during the training process of the neural network.
+
+            steps: training steps.
+            
+            lr: learning rate.
+            
+            optimizer: training optimizer(default: Adam).
+        """
+        super().__init__(name='PPQ Rounding Tuning Pass')
+        self.interested_layers  = interested_layers
+        self.collecting_device  = collecting_device
+        self.expire_device      = expire_device
+        self.block_size         = block_size
+        self.steps              = steps
+        self.lr                 = lr
+        self.optimizer          = optimizer
+        self.loss_fn            = torch.nn.MSELoss()
+
+    def finetune(
+        self, steps: int, learning_rate: float, block: TrainableBlock, executor: TorchExecutor,
+        qt_inputs: List[Dict[str, torch.Tensor]], fp_outputs: List[Dict[str, torch.Tensor]], 
+        optimizer: torch.optim.Optimizer=None, scheduler: object=None) -> float:
+
+        # step - 1: enable gradient for training.
+        self.enable_block_gradient(block)
+
+        # record pre training loss.
+        pre_loss = self.compute_block_loss(
+            block=block, qt_inputs=qt_inputs, 
+            fp_outputs=fp_outputs, executor=executor)
+
+        # collect trainable params
+        trainable_params, delegators = [], {}
+        for op in block.rps:
+            if not isinstance(op, QuantableOperation): continue
+            if op.num_of_parameter == 0: continue
+
+            if op.type in {'Gemm', 'MatMul', 'ConvTranspose', 'PPQBiasFusedMatMul', 'Conv'}:
+                if op.inputs[1].is_parameter:
+                    cfg, var = op.config.input_quantization_config[1], op.inputs[1]
+                    delegator = RoundTruningDelegator(config=cfg, var=var)
+                    trainable_params.append(delegator._rounding)
+                    executor.register_quantize_delegate(config=cfg, delegator=delegator)
+                    delegators[cfg] = delegator
+
+                if op.num_of_input == 3 and op.inputs[-1].is_parameter:
+                    op.inputs[-1].value.requires_grad = True # clear it.
+                    trainable_params.append(op.inputs[-1].value)
+
+        # check if empty.
+        tensors = [tensor for tensor in trainable_params if tensor.requires_grad]
+        tensors = set(tensors) # remove duplicated tensor
+        if len(tensors) == 0:
+            for cfg, delegator in delegators.items():
+                executor.remove_quantize_delegate(config=cfg)
+            return 0, 0
+
+        # initilize optimizer.
+        if self.optimizer is None:
+            optimizer = torch.optim.Adam(tensors, lr=learning_rate)
+        else: optimizer = self.optimizer(tensors, lr=learning_rate)
+
+        dataset_length = len(qt_inputs)
+        if dataset_length == 0: raise ValueError('Dataset is empty.')
+
+        # step 2 - training procedure
+        for idx in tqdm(range(steps), desc='# Tuning Procedure '):
+            qt_input, fp_output = qt_inputs[idx % dataset_length], fp_outputs[idx % dataset_length]
+
+            # forward
+            optimizer.zero_grad()
+            feed_dict = {k: v.to(executor._device) for k, v in qt_input.items()}
+            output_names = [name for name in fp_output]
+
+            qt_output = executor.partial_graph_forward(
+                operations=block.rps, feed_dict=feed_dict, 
+                output_names=output_names)
+
+            # compute loss
+            loss = 0.0
+            for idx, name in enumerate(output_names):
+                loss += self.loss_fn(qt_output[idx], fp_output[name].to(executor._device))
+
+            # backward from loss
+            assert isinstance(loss, torch.Tensor)
+            loss.backward()
+            optimizer.step()
+            if scheduler is not None: scheduler.step()
+
+        # step - 3: record post training loss
+        post_loss = self.compute_block_loss(
+            block=block, qt_inputs=qt_inputs, fp_outputs=fp_outputs,
+            executor=executor, loss_fn=self.loss_fn)
+        # check and withdraw
+        if post_loss > pre_loss:
+            for cfg, delegator in delegators.items():
+                delegator.withdraw()
+
+        for cfg, delegator in delegators.items():
+            delegator.finalize()
+            executor.remove_quantize_delegate(config=cfg)
+
+        # disable gradient for evaluation.
+        self.disable_block_gradient(block)
+        
+        # clear cache
+        torch.cuda.empty_cache()
+        return pre_loss, post_loss
+
+    def optimize(
+        self, graph: BaseGraph,
+        dataloader: Iterable, executor: BaseGraphExecutor,
+        collate_fn: Callable, **kwargs) -> None:
+
+        blocks = self.split_graph_into_blocks(
+            graph=graph, executing_order=executor._executing_order,
+            blocksize=self.block_size, interested_layers=self.interested_layers)
+
+        # ready for finetuning, print information.
+        print('')
+        print('Check following parameters:')
+        print(f'Interested Layers:         {self.interested_layers}')
+        print(f'Collecting Device:         {self.collecting_device}')
+        print(f'Num of blocks:             {len(blocks)}')
+        print(f'Learning Rate:             {self.lr}')
+        print(f'Steps:                     {self.steps}')
         print('') # blank line
 
         # do per-block finetune

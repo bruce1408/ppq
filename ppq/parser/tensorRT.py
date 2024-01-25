@@ -54,6 +54,13 @@ class TensorRTExporter_QDQ(ONNXRUNTIMExporter):
 
 
 class TensorRTExporter_JSON(GraphExporter):
+    """
+    使用该导出器导出符合 TensorRT 格式要求的量化模型。
+    
+    PPQ 可以将 TQC 中的量化信息导出到 json，并遵循 TensorRT 支持的格式。
+    用户可以通过 Json 文件将图中所有 variable 的 min, max 传递给 TensorRT
+    所有未写入 min, max 的变量将保持 fp32(fp16) 精度执行。
+    """
     def export_quantization_config(self, config_path: str, graph: BaseGraph):
         act_quant_info = {}
         for op in graph.topological_sort():
@@ -107,13 +114,14 @@ class TensorRTExporter_JSON(GraphExporter):
 
 
     def export(self, file_path: str, graph: BaseGraph, config_path: str = None, input_shapes: List[List[int]] = [[1, 3, 224, 224]]):
-        ppq_info('You are about to export PPQ Graph to TensorRT. \n'
-           'This Exporter will generate an onnx file for describing model structure together with a json file for passing quantization param. '
-           'You are supposed to compile TensorRT INT8 engine via following script manually: ppq.utils.write_qparams_onnx2trt.py')
-
+        ppq_info(
+            'You are exporting PPQ Graph to TensorRT(Onnx + Json). \n'
+            'Please Compile the TensorRT INT8 engine manually: \n\n'
+            'from ppq.utils.TensorRTUtil import build_engine \n'
+            "build_engine(onnx_file='Quantized.onnx', int8_scale_file='Quantized.json', engine_file='Quantized.engine', int8=True)\n")
         if config_path is not None:
             self.export_quantization_config(config_path, graph)
-        self.export_weights(graph, config_path)
+            self.export_weights(graph, config_path)
         _, ext = os.path.splitext(file_path)
         if ext == '.onnx':
             exporter = OnnxExporter()
@@ -121,7 +129,7 @@ class TensorRTExporter_JSON(GraphExporter):
         elif ext in {'.prototxt', '.caffemodel'}:
             exporter = CaffeExporter()
             exporter.export(file_path=file_path, graph=graph, config_path=None, input_shapes=input_shapes)
-        
+
         # no pre-determined export format, we export according to the
         # original model format
         elif graph._built_from == NetworkFramework.CAFFE:

@@ -169,12 +169,12 @@ class QuantizeFusionPass(QuantizationOptimizationPass):
     def __init__(self,
                  activation_type: Set[str],
                  fuse_activation: bool = True,
-                 fuse_matmul_add: bool = True,
-                 fuse_passive_op: bool = True) -> None:
+                 fuse_passive_op: bool = True,
+                 fuse_relu_clip: bool = True) -> None:
         self.fuse_activation  = fuse_activation
         self.fuse_passive_op  = fuse_passive_op
+        self.fuse_relu_clip   = fuse_relu_clip
         self.activation_types = activation_type
-        self.fuse_matmul_add  = fuse_matmul_add
         super().__init__(name='PPQ Quantization Fusion Pass')
 
     def is_same_platform(self, operations: List[Operation]):
@@ -212,60 +212,99 @@ class QuantizeFusionPass(QuantizationOptimizationPass):
                     act_op.config.input_quantization_config[0].dominated_by = (
                         act_op.config.output_quantization_config[0])
 
-            # fuse relu and clip if possible
-            for op in graph.operations.values():
-                if op.type in {'Relu', 'Clip'}:
-                    upstream_op = op.inputs[0].source_op
-                    if not isinstance(op, QuantableOperation): continue
-                    if upstream_op is None: continue
-                    if upstream_op.platform != op.platform: continue
-                    if not isinstance(upstream_op, QuantableOperation): continue
-                    if len(graph.get_downstream_operations(upstream_op)) != 1: continue
-                    upstream_op.config.output_quantization_config[0].dominated_by = (
-                        op.config.output_quantization_config[0])
-                    op.config.input_quantization_config[0].dominated_by = (
-                        op.config.output_quantization_config[0])
+            if 'Swish' in self.activation_types:
+                search_engine = SearchableGraph(graph)
+                patterns = search_engine.pattern_matching(
+                    patterns = [lambda x: x.is_computing_op, 'Sigmoid', 'Mul'],
+                    edges = [[0, 1], [1, 2], [0, 2]],
+                    exclusive = True)
+
+                for pattern in patterns:
+                    if any([not isinstance(op, QuantableOperation) for op in pattern]):
+                        ppq_warning(f'There is a pattern of swish activation in your network start from {pattern[0]}, '
+                                    'however part of your swish activation is not quantable, '
+                                    'so that graph fusion can not merge their quantization configuration.')
+                        continue
+                    if any([op.platform != pattern[0].platform for op in pattern]):
+                        ppq_warning(f'There is a pattern of swish activation in your network start from {pattern[0]}, '
+                                    'however part of your swish activation is not quantable, '
+                                    'so that graph fusion can not merge their quantization configuration.')
+                        continue
+                    computing, sigmoid, mul = pattern
+
+                    assert isinstance(computing, QuantableOperation)
+                    assert isinstance(sigmoid, QuantableOperation)
+                    assert isinstance(mul, QuantableOperation)
+
+                    master_config = mul.config.output_quantization_config[0]
+                    computing.config.output_quantization_config[0].dominated_by = master_config
+                    sigmoid.config.input_quantization_config[0].dominated_by    = master_config
+                    sigmoid.config.output_quantization_config[0].dominated_by   = master_config
+                    mul.config.input_quantization_config[0].dominated_by        = master_config
+                    mul.config.input_quantization_config[1].dominated_by        = master_config
+
+            if 'Mish' in self.activation_types:
+                search_engine = SearchableGraph(graph)
+                patterns = search_engine.pattern_matching(
+                    patterns = [lambda x: x.is_computing_op, 'Softplus', 'Tanh', 'Mul'],
+                    edges = [[0, 1], [1, 2], [2, 3], [0, 3]],
+                    exclusive = True)
+
+                for pattern in patterns:
+                    if any([not isinstance(op, QuantableOperation) for op in pattern]):
+                        ppq_warning(f'There is a pattern of mish activation in your network start from {pattern[0]}, '
+                                    'however part of your mish activation is not quantable, '
+                                    'so that graph fusion can not merge their quantization configuration.')
+                        continue
+                    if any([op.platform != pattern[0].platform for op in pattern]):
+                        ppq_warning(f'There is a pattern of mish activation in your network start from {pattern[0]}, '
+                                    'however part of your mish activation is not quantable, '
+                                    'so that graph fusion can not merge their quantization configuration.')
+                        continue
+                    computing, softplus, tanh, mul = pattern
+
+                    assert isinstance(computing, QuantableOperation)
+                    assert isinstance(softplus, QuantableOperation)
+                    assert isinstance(tanh, QuantableOperation)
+                    assert isinstance(mul, QuantableOperation)
+
+                    master_config = mul.config.output_quantization_config[0]
+                    computing.config.output_quantization_config[0].dominated_by = master_config
+                    tanh.config.input_quantization_config[0].dominated_by       = master_config
+                    tanh.config.output_quantization_config[0].dominated_by      = master_config
+                    softplus.config.input_quantization_config[0].dominated_by   = master_config
+                    softplus.config.output_quantization_config[0].dominated_by  = master_config
+                    mul.config.input_quantization_config[0].dominated_by        = master_config
+                    mul.config.input_quantization_config[1].dominated_by        = master_config
 
         if self.fuse_passive_op:
             # all passive operations should never changes quantization configuration of its input
             # so to say their input and output share a same scale.
             for op in graph.operations.values():
-                upstream_layers = graph.get_upstream_operations(op)
-                if len(upstream_layers) == 0: continue # beginning op, can not merge.
-                if (isinstance(op, QuantableOperation) and op.type in PASSIVE_OPERATIONS and
-                    self.is_same_platform(upstream_layers + [op])):
-                    # There are many types of passive operations.
-                    # 'Resize', 'MaxPool', 'GlobalMaxPool',
-                    # 'Slice', 'Pad', 'Split'
-
-                    # Their first input variable should be data.
-                    input_cfg = op.config.input_quantization_config[0]
+                if op.type not in PASSIVE_OPERATIONS: continue
+                source_op = op.inputs[0].source_op
+                if source_op is None: continue # beginning op, can not merge.
+                if (isinstance(op, QuantableOperation) and 
+                    self.is_same_platform([op, source_op])):
+                    TQC = op.config.input_quantization_config[0]
                     for output_cfg in op.config.output_quantization_config:
-                        output_cfg.dominated_by = input_cfg
-        
-        if self.fuse_matmul_add:
+                        output_cfg.dominated_by = TQC
+
+        if self.fuse_relu_clip:
             patterns = processor.pattern_matching(
-                patterns=[lambda x: x.type == 'MatMul', lambda x: x.type == 'Add'],
+                patterns=[lambda x: True, lambda x: x.type in {'Relu', 'Clip'}],
                 edges=[[0, 1]], exclusive=True)
-    
-            for matmul, add in patterns:
-                if add.num_of_parameter != 1: continue
-                if not isinstance(matmul, QuantableOperation): continue
-                if not isinstance(add, QuantableOperation): continue
+            for computing_op, act_op in patterns:
+                if not isinstance(act_op, QuantableOperation): continue
+                if not isinstance(computing_op, QuantableOperation): continue
 
-                if (matmul.platform != add.platform and
-                    matmul.config.output_quantization_config[0].state != QuantizationStates.FP32):
-                    ppq_warning(f'Unexpected dispatching was found: '
-                                f'Op {matmul.name} and {add.name} should be send to a same platform.')
-                    continue
-
-                if (len(graph.get_downstream_operations(matmul)) == 1 and 
-                    len(graph.get_upstream_operations(add)) == 1):
-                    matmul.config.output_quantization_config[0].dominated_by = (
-                        add.config.output_quantization_config[0])
-                    add.config.input_quantization_config[0].dominated_by = (
-                        add.config.output_quantization_config[0])
-
+                if (len(graph.get_downstream_operations(computing_op)) == 1 and 
+                    len(graph.get_upstream_operations(act_op)) == 1):
+                    computing_op.config.output_quantization_config[0].dominated_by = (
+                        act_op.config.output_quantization_config[0])
+                    act_op.config.input_quantization_config[0].dominated_by = (
+                        act_op.config.output_quantization_config[0])
+  
 
 class QuantAlignmentPass(QuantizationOptimizationPass):
     """
@@ -373,7 +412,7 @@ class QuantAlignmentPass(QuantizationOptimizationPass):
                  elementwise_alignment: str = 'Align to Large',
                  concat_alignment: str = 'Align to Output',
                  pooling_alignment: str = 'None',
-                 resize_alignment: str = 'Align to Output',
+                 resize_alignment: str = 'None',
                  force_overlap: bool = False) -> None:
         self.pooling_alignment       = pooling_alignment
         self.elementwise_alignment   = elementwise_alignment
@@ -399,6 +438,7 @@ class QuantAlignmentPass(QuantizationOptimizationPass):
         """
         master_config = op.config.input_quantization_config[0]
         for slave_config in op.config.output_quantization_config:
+            if slave_config.policy.has_property(QuantizationProperty.FLOATING): continue
             if slave_config.state not in {QuantizationStates.FP32, QuantizationStates.SOI}:
                 slave_config.master_by = master_config
         return master_config
@@ -413,10 +453,10 @@ class QuantAlignmentPass(QuantizationOptimizationPass):
         global_min, global_max, master_config = 0, 0, op.config.input_quantization_config[0]
         for config in op.config.input_quantization_config:
             if config.state in {QuantizationStates.FP32, QuantizationStates.SOI}: continue
+            if config.policy.has_property(QuantizationProperty.FLOATING): continue
             
             assert config.policy.has_property(QuantizationProperty.PER_TENSOR), (
                 'Quant Alignment can only happen with per tensor quantization.')
-            if config.policy.has_property(QuantizationProperty.FLOATING): return
             local_min = config.scale * (config.quant_min - config.offset)
             local_max = config.scale * (config.quant_max - config.offset)
 
@@ -431,11 +471,13 @@ class QuantAlignmentPass(QuantizationOptimizationPass):
 
         device = master_config.scale.device
         master_config._dominator = master_config
-        master_config.state  = QuantizationStates.ACTIVATED
+        master_config.state  = QuantizationStates.PASSIVE
         master_config.scale  = torch.tensor(scale, dtype=torch.float32, device=device)
         master_config.offset = torch.tensor(offset, dtype=torch.float32, device=device)
 
         for slave_config in op.config.input_quantization_config[1: ]:
+            if config.state in {QuantizationStates.FP32, QuantizationStates.SOI}: continue
+            if config.policy.has_property(QuantizationProperty.FLOATING): continue
             slave_config.master_by = master_config
         return master_config
 
@@ -448,6 +490,7 @@ class QuantAlignmentPass(QuantizationOptimizationPass):
         """
         master_config = op.config.output_quantization_config[0]
         for slave_config in op.config.input_quantization_config:
+            if slave_config.policy.has_property(QuantizationProperty.FLOATING): continue
             if slave_config.state not in {QuantizationStates.FP32, QuantizationStates.SOI}:
                 slave_config.master_by = master_config
         return master_config
@@ -505,7 +548,7 @@ class QuantAlignmentPass(QuantizationOptimizationPass):
                     if len(graph.get_downstream_operations(up_op)) != 1 and not self.force_overlap: continue
                     for cfg, var in up_op.config_with_variable:
                         if operation in var.dest_ops:
-                            cfg._dominator = master_config
+                            cfg.master_by = master_config
 
 
 class SwishFusionPass(QuantizationOptimizationPass):

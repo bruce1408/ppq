@@ -14,6 +14,7 @@ from .defs import ppq_warning, SingletonMeta
 
 
 class ComplieHelper(metaclass=SingletonMeta):
+    """ PPQ-Torch Compile Wrapper. """
     def __init__(self) -> None:
         self.__CUDA_EXTENTION__ = None
 
@@ -83,7 +84,6 @@ class CUDA:
         maximum: int = 127,
         rounding: int = 0
     ) -> torch.Tensor:
-        if not tensor.is_contiguous(): tensor = tensor.contiguous()
         # if scale is too small, quantization might cause fp32 underflow.
         # if scale < 1e-7: raise ValueError('scale is too small.')
         return CUDA_COMPLIER.CUDA_EXTENSION.QuantizeTensor_LT(
@@ -99,7 +99,6 @@ class CUDA:
         maximum: int = 127,
         rounding: int = 0
     ) -> torch.Tensor:
-        if not tensor.is_contiguous(): tensor = tensor.contiguous()
         return CUDA_COMPLIER.CUDA_EXTENSION.QuantizeTensor_LC(
             tensor, scales, offsets, minimum, maximum, channel_axis, rounding)
 
@@ -113,7 +112,6 @@ class CUDA:
         maximum: int,
         rounding: int,
     ) -> List[torch.Tensor]:
-        if not tensor.is_contiguous(): tensor = tensor.contiguous()
         return CUDA_COMPLIER.CUDA_EXTENSION.QuantizeTensor_LT_B(
             tensor, scales, offsets,
             dy, minimum, maximum, rounding
@@ -130,7 +128,6 @@ class CUDA:
         channel_axis: int,
         rounding: int,
     ) -> List[torch.Tensor]:
-        if not tensor.is_contiguous(): tensor = tensor.contiguous()
         return CUDA_COMPLIER.CUDA_EXTENSION.QuantizeTensor_LC_B(
             tensor, scales, offsets,
             dy, minimum, maximum, rounding, channel_axis

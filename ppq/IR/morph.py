@@ -14,6 +14,7 @@ from .processer import GraphCommandProcessor
 
 
 class GraphReplacer(GraphCommandProcessor):
+    """ Graph Replacer offers a bunch of graph editing functions that helps replacing operation or variable in your graph. """
     def process(self, command: GraphCommand) -> Any:
         if command.command_type == GraphCommandType.REPLACE_OP:
             assert isinstance(command, ReplaceOperationCommand), \
@@ -152,6 +153,7 @@ class GraphReplacer(GraphCommandProcessor):
 
 
 class GraphFormatter(GraphCommandProcessor):
+    """ Graph Formatter offers a bunch of graph editing functions that helps modifying your graph. """
     def _acceptable_command_types(self) -> List[GraphCommandType]:
         return [
             GraphCommandType.FORMAT_CLIP,
@@ -443,6 +445,7 @@ class GraphFormatter(GraphCommandProcessor):
     def format_parameter(self) -> None:
         """ Split parameter that has more than 1 dest ops """
         for var in [_ for _ in self.graph.variables.values()]:
+            var.value = convert_any_to_torch_tensor(var.value)
             if var.is_parameter and len(var.dest_ops) > 1:
                 for op in var.dest_ops:
                     created = self.graph.create_variable(
@@ -544,11 +547,11 @@ class GraphMerger(GraphCommandProcessor):
                 w = computing_op.parameters[0].value  # no bias.
                 assert isinstance(w, torch.Tensor), 'values of parameters are assumed as torch Tensor'
                 if computing_op.type == 'ConvTranspose':
-                    b = torch.zeros(size=w.shape[1] * computing_op.attributes.get('group', 1))
+                    b = torch.zeros(w.shape[1] * computing_op.attributes.get('group', 1))
                 elif computing_op.type == 'Gemm' and computing_op.attributes.get('transB', 0) == 0:
-                    b = torch.zeros(size=w.shape[1])
+                    b = torch.zeros(w.shape[1])
                 else:
-                    b = torch.zeros(size=w.shape[0])
+                    b = torch.zeros(w.shape[0])
             else:
                 w, b = [var.value for var in computing_op.parameters[: 2]]  # has bias.
 
@@ -573,9 +576,9 @@ class GraphMerger(GraphCommandProcessor):
 
                 scale = alpha / torch.sqrt(var + epsilon)
                 group = computing_op.attributes.get('group', 1)
-                scale = scale.reshape([group, 1, -1, 1, 1])
-                w = w.reshape([group, -1, w.shape[1], w.shape[2], w.shape[3]]) * scale
-                w = w.reshape([w.shape[0] * w.shape[1], w.shape[2], w.shape[3], w.shape[4]])
+                scale = scale.reshape([group, 1, -1] + [1] * (w.ndim - 2))
+                w = w.reshape([group, -1] + list(w.shape[1:])) * scale
+                w = w.reshape([w.shape[0] * w.shape[1]] + list(w.shape[2:]))
                 b = alpha * (b - mean) / torch.sqrt(var + epsilon) + beta
             else:
                 raise TypeError(
@@ -601,6 +604,7 @@ class GraphMerger(GraphCommandProcessor):
             computing_op.inputs.pop(0)
             bn_op.outputs.clear()
             self.graph.remove_operation(computing_op)
+            self.graph.remove_operation(bn_op)
 
             # insert new
             self.graph.append_operation(merged_op)
@@ -1037,6 +1041,38 @@ class GraphMerger(GraphCommandProcessor):
             for k, v in op.attributes.values():
                 if v is not None: non_empty_attr[k] = v
             op._attributes = non_empty_attr
+
+    def fuse_matmul_add(self, verbose: bool = True):
+        """
+        Fuse Matmul + bias add to PPQBiasFusedMatMul
+        
+        PPQBiasFusedMatMul is a temporary operation which will be splited when exporting.
+        """
+        graph, fused = self.graph, False
+        for current_op in [_ for _ in graph.operations.values()]:
+            if current_op.type != 'MatMul': continue
+            
+            # check down-stream op is add
+            next_ops = graph.get_downstream_operations(current_op)
+            if len(next_ops) != 1: continue
+            if next_ops[0].type != 'Add': continue
+            
+            # check if is a constant add
+            fusing_op = next_ops[0]
+            if fusing_op.num_of_parameter == 1:
+
+                # do graph fusion
+                bias = fusing_op.parameters[0].value
+                graph.remove_operation(fusing_op, keep_coherence=True)
+                graph.create_variable(value=bias, is_parameter=True, dest_ops=[current_op])
+                current_op.type = 'PPQBiasFusedMatMul'
+                fused = True
+
+                if verbose:
+                    print(f'Fusing graph op: {current_op.name} + {fusing_op.name}')
+
+        if not fused:
+            ppq_warning("No suitable matmul + add was found, check your graph again.")
 
 
 class GraphDecomposer(GraphCommandProcessor):
